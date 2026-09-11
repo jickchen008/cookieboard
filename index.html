@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CookieBoard — 链上留言板 on Cookie Chain</title>
+  <meta name="description" content="CookieBoard is a cApp on Cookie Chain: connect a wallet and write messages permanently on-chain." />
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div class="bg-glow"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🍪</span>
+      <div>
+        <div class="brand-name">CookieBoard</div>
+        <div class="brand-sub">链上留言板 · 永久刻在 Cookie Chain 上</div>
+      </div>
+    </div>
+    <div class="net">
+      <span id="net-dot" class="dot dot-wait"></span>
+      <span id="net-text">连接节点中…</span>
+      <span class="sep">·</span>
+      <span>高度 <b id="block-height">—</b></span>
+      <span class="sep">·</span>
+      <span class="core" id="core-ver">—</span>
+    </div>
+  </header>
+
+  <main class="wrap">
+
+    <section class="hero">
+      <h1>把一句话，刻在链上。</h1>
+      <p>连接你的 SVM 钱包，写一条留言。它会作为一笔真实交易，永久记录在 Cookie Chain 上 —— 亚秒确认，手续费不到一分钱。</p>
+    </section>
+
+    <div class="grid">
+
+      <!-- 左：钱包 -->
+      <section class="card">
+        <div class="card-head">
+          <h2>1 · 连接钱包</h2>
+          <button id="disconnect-btn" class="btn btn-ghost hidden">断开</button>
+        </div>
+
+        <div id="wallet-panel">
+          <button id="connect-btn" class="btn btn-primary btn-block">连接钱包</button>
+          <p class="hint">支持 Nightly、Phantom、Solflare、Backpack 等 Wallet Standard 钱包。</p>
+          <div id="wallet-list" class="wallet-list hidden"></div>
+        </div>
+
+        <div id="account-panel" class="account hidden">
+          <div class="acct-row">
+            <span class="acct-label">地址</span>
+            <a id="account-addr" class="mono" href="#" target="_blank" rel="noreferrer">—</a>
+          </div>
+          <div class="acct-row">
+            <span class="acct-label">原生余额</span>
+            <span id="account-balance" class="mono">—</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 右：写留言 -->
+      <section class="card">
+        <div class="card-head">
+          <h2>2 · 写一条留言</h2>
+        </div>
+        <textarea id="memo-input" maxlength="180" rows="4"
+          placeholder="说点什么…（最多 180 字符，会作为 Memo 指令上链）"></textarea>
+        <div class="compose-foot">
+          <span id="char-count" class="hint">0 / 180</span>
+          <button id="post-btn" class="btn btn-primary" disabled>刻在链上</button>
+        </div>
+        <div id="status" class="status"></div>
+      </section>
+
+    </div>
+
+    <section class="card board-card">
+      <div class="card-head">
+        <h2>我的链上留言</h2>
+        <button id="refresh-btn" class="btn btn-ghost">刷新</button>
+      </div>
+      <div id="board" class="board">
+        <p class="empty">连接钱包后，这里会显示你写过的留言。</p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="foot">
+    <span>CookieBoard · built on Cookie Chain (SVM)</span>
+    <span class="sep">·</span>
+    <a href="https://www.cookiechain.wtf" target="_blank" rel="noreferrer">Cookie Chain</a>
+    <span class="sep">·</span>
+    <a href="https://cookiescan.io" target="_blank" rel="noreferrer">CookieScan</a>
+  </footer>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
