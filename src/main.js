@@ -3,10 +3,33 @@
  *
  * 核心流程：
  *   连接钱包 → 构造 Memo 指令 → 钱包签名并发送 → 等待确认 → 上链
+ *
  * 亮点：
- *   - 使用 Wallet Standard 发现钱包（含 Nightly），并兼容传统注入式 provider
- *   - 交易状态全链路反馈（准备 / 签名 / 广播 / 确认 / 失败）
- *   - 从链上历史回溯用户写过的留言（getSignaturesForAddress + getParsedTransaction）
+ *   1. Wallet Standard 发现钱包（含 Nightly），并兼容传统注入式 provider
+ *   2. 交易状态全链路反馈（准备 / 签名 / 广播 / 确认 / 失败）
+ *   3. 从链上回溯用户写过的留言
+ *   4. 公开链上动态：**无需连接钱包**即可读取全链最新 Memo 记录
+ *
+ * ─────────────────────────────────────────────────────────────
+ * Cookie Chain RPC 兼容性说明（对 rpc.cookiescan.io 实测，两个坑都踩过）
+ *
+ *   节点支持：getSignaturesForAddress / getTransaction / getAccountInfo / getBalance /
+ *            getLatestBlockhash / getSignatureStatuses / getVersion / getEpochInfo /
+ *            getHealth / getGenesisHash / getFeeForMessage / JSON-RPC 批量请求
+ *   节点不支持：getParsedTransaction → {"error":{"code":-32601,"message":"Method not found"}}
+ *
+ *   坑 1：不能用 connection.getParsedTransaction() —— 节点根本没实现这个方法。
+ *   坑 2：也不能用 connection.getTransaction(sig, {encoding:'jsonParsed'}) ——
+ *         @solana/web3.js v1 会对返回结构做超严格校验，而 jsonParsed 返回的
+ *         accountKeys 是对象数组（{pubkey,signer,...}），校验器要求是字符串，
+ *         于是直接抛 StructError：Expected a string, but received [object Object]。
+ *
+ *   因此本应用读取链上数据一律走**原始 JSON-RPC**（下方 rpc / rpcBatch），
+ *   只在构造交易、签名、发交易这些真正需要 SDK 的地方使用 @solana/web3.js。
+ *   读留言的两条路，按优先级：
+ *     A. getSignaturesForAddress 返回的条目自带 `memo` 字段（实测覆盖率 100%，最快）
+ *     B. 回退到原始 RPC 的 getTransaction(encoding:'jsonParsed')，从已解析指令取 Memo
+ * ─────────────────────────────────────────────────────────────
  */
 
 import {
@@ -21,12 +44,57 @@ import bs58 from 'bs58';
 // ------------------------------------------------------------------ 常量
 const RPC_ENDPOINT = 'https://rpc.cookiescan.io';
 const MEMO_PROGRAM_ID = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
-const EXPLORER_TX = 'https://cookiescan.io/tx/';
-const EXPLORER_ADDR = 'https://cookiescan.io/address/';
+const MEMO_PROGRAM_STR = MEMO_PROGRAM_ID.toBase58();
+
+/** 链身份：钱包用 genesis hash 认链（solana:<genesisHash>），不是 solana:mainnet */
+const GENESIS_HASH = '9wDaBRDgArEUpvhHxGguNkwozsZh4UpGZB9o2EoEcBB2';
+const CHAIN_ID = `solana:${GENESIS_HASH}`;
+
+const EXPLORER = 'https://cookiescan.io';
+const EXPLORER_TX = `${EXPLORER}/tx/`;
+const EXPLORER_ADDR = `${EXPLORER}/address/`;
+
 const MAX_LEN = 180;
+const FEED_SIZE = 12;
 
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const { get: getStandardWallets } = getWallets();
+
+// ------------------------------------------------------------------ 原始 JSON-RPC
+/**
+ * 直接打节点，绕过 @solana/web3.js 的结构校验。
+ * 见文件头「兼容性说明」：web3.js v1 处理不了 jsonParsed 返回的 accountKeys 结构。
+ */
+async function rpc(method, params = []) {
+  const res = await fetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.error) throw new Error(json.error.message || 'RPC error');
+  return json.result;
+}
+
+/** 批量请求：一次 HTTP 换取 N 个结果（节点支持 JSON-RPC batch） */
+async function rpcBatch(calls) {
+  if (!calls.length) return [];
+  const res = await fetch(RPC_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(
+      calls.map((c, i) => ({ jsonrpc: '2.0', id: i, method: c.method, params: c.params }))
+    ),
+  });
+  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+  const arr = await res.json();
+  const out = new Array(calls.length).fill(null);
+  for (const item of Array.isArray(arr) ? arr : [arr]) {
+    if (item && typeof item.id === 'number') out[item.id] = item.result ?? null;
+  }
+  return out;
+}
 
 // ------------------------------------------------------------------ DOM
 const $ = (id) => document.getElementById(id);
@@ -35,6 +103,7 @@ const ui = {
   netText: $('net-text'),
   blockHeight: $('block-height'),
   coreVer: $('core-ver'),
+  txTotal: $('tx-total'),
   connectBtn: $('connect-btn'),
   walletList: $('wallet-list'),
   walletPanel: $('wallet-panel'),
@@ -48,6 +117,9 @@ const ui = {
   status: $('status'),
   board: $('board'),
   refreshBtn: $('refresh-btn'),
+  feed: $('feed'),
+  feedRefreshBtn: $('feed-refresh'),
+  feedCount: $('feed-count'),
 };
 
 // ------------------------------------------------------------------ 状态
@@ -58,10 +130,32 @@ const state = {
   address: null,
   kind: null,     // 'standard' | 'legacy'
   busy: false,
+  feedLoaded: false,
 };
+/** 作者地址缓存：signature -> 地址（避免重复请求交易详情） */
+const authorCache = new Map();
 
 // ------------------------------------------------------------------ 工具
 const short = (a, n = 4) => (a ? `${a.slice(0, n)}…${a.slice(-n)}` : '—');
+
+const fmtTime = (blockTime) =>
+  blockTime ? new Date(blockTime * 1000).toLocaleString('zh-CN') : '未知时间';
+
+const agree = (blockTime) => {
+  if (!blockTime) return '';
+  const diff = Math.floor(Date.now() / 1000) - blockTime;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  return `${Math.floor(diff / 86400)} 天前`;
+};
+
+/**
+ * getSignaturesForAddress 返回的 memo 会带一个字节长度前缀，例如 "[63] 正文"。
+ * 这里剥掉它，拿到干净的留言正文。
+ */
+const stripMemoPrefix = (memo) =>
+  typeof memo === 'string' ? memo.replace(/^\[\d+\]\s*/, '') : '';
 
 function setStatus(text, type = 'info', link) {
   ui.status.className = `status status-${type}`;
@@ -84,17 +178,28 @@ const clearStatus = () => {
   ui.status.textContent = '';
 };
 
+/** 从交易详情里取签名者地址（fee payer = accountKeys[0]） */
+function payerOf(tx) {
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const first = keys[0];
+  return typeof first === 'string' ? first : first?.pubkey || null;
+}
+
 // ------------------------------------------------------------------ 网络状态
 async function loadNetwork() {
   try {
-    const [height, version] = await Promise.all([
+    const [height, version, epochInfo] = await Promise.all([
       connection.getBlockHeight('confirmed'),
       connection.getVersion(),
+      connection.getEpochInfo('confirmed').catch(() => null),
     ]);
     ui.netDot.className = 'dot dot-ok';
     ui.netText.textContent = 'Cookie Chain 节点正常';
     ui.blockHeight.textContent = height.toLocaleString();
     ui.coreVer.textContent = `core ${version['solana-core'] || '—'}`;
+    if (epochInfo?.transactionCount != null && ui.txTotal) {
+      ui.txTotal.textContent = Number(epochInfo.transactionCount).toLocaleString();
+    }
   } catch (err) {
     ui.netDot.className = 'dot dot-bad';
     ui.netText.textContent = '节点连接失败';
@@ -136,7 +241,9 @@ function renderWalletList(wallets) {
   if (!wallets.length) {
     ui.walletList.classList.remove('hidden');
     ui.walletList.innerHTML =
-      '<p class="hint">未检测到钱包。请安装 <a href="https://nightly.app" target="_blank" rel="noreferrer">Nightly</a> 或 Phantom 后刷新页面。</p>';
+      '<p class="hint">未检测到钱包。想发留言，请安装 ' +
+      '<a href="https://nightly.app" target="_blank" rel="noreferrer">Nightly</a> 或 Phantom 后刷新页面；' +
+      '只想看链上动态的话，不需要钱包。</p>';
     return;
   }
   for (const w of wallets) {
@@ -176,6 +283,7 @@ async function connectWallet(w) {
       state.wallet = w.wallet;
       state.account = acct;
       address = acct.address;
+      watchWalletEvents(w.wallet);
     } else {
       const res = await w.provider.connect();
       const pk = res?.publicKey || w.provider.publicKey;
@@ -185,14 +293,7 @@ async function connectWallet(w) {
     }
     state.address = address;
     state.kind = w.kind;
-
-    ui.walletPanel.classList.add('hidden');
-    ui.disconnectBtn.classList.remove('hidden');
-    ui.accountPanel.classList.remove('hidden');
-    ui.accountAddr.textContent = short(address, 6);
-    ui.accountAddr.href = EXPLORER_ADDR + address;
-    ui.accountAddr.title = address;
-    ui.postBtn.disabled = false;
+    reflectConnected(w.name, address);
 
     setStatus(`已连接 ${w.name}`, 'ok');
     await Promise.all([refreshBalance(), loadMemos()]);
@@ -202,6 +303,36 @@ async function connectWallet(w) {
   } finally {
     state.busy = false;
   }
+}
+
+function reflectConnected(name, address) {
+  ui.walletPanel.classList.add('hidden');
+  ui.disconnectBtn.classList.remove('hidden');
+  ui.accountPanel.classList.remove('hidden');
+  ui.accountAddr.textContent = short(address, 6);
+  ui.accountAddr.href = EXPLORER_ADDR + address;
+  ui.accountAddr.title = address;
+  ui.postBtn.disabled = false;
+  ui.disconnectBtn.textContent = `断开 ${name}`;
+}
+
+/** 监听钱包账户切换 / 断开，保持界面与钱包一致 */
+function watchWalletEvents(wallet) {
+  const events = wallet.features?.['standard:events'];
+  if (!events?.on) return;
+  events.on('change', ({ accounts }) => {
+    const acct = accounts?.[0];
+    if (!acct) {
+      disconnect();
+      return;
+    }
+    if (acct.address === state.address) return;
+    state.account = acct;
+    state.address = acct.address;
+    reflectConnected(wallet.name, acct.address);
+    setStatus('钱包账户已切换', 'ok');
+    Promise.all([refreshBalance(), loadMemos()]);
+  });
 }
 
 async function disconnect() {
@@ -268,7 +399,8 @@ async function postMemo() {
     let signature;
     if (state.kind === 'standard') {
       const feature = state.wallet.features['solana:signAndSendTransaction'];
-      const chain = state.account.chains?.[0] || 'solana:mainnet';
+      // 优先用钱包为该账户声明的链；否则回退到 Cookie Chain 的链标识
+      const chain = state.account?.chains?.[0] || CHAIN_ID;
       const outputs = await feature.signAndSendTransaction({
         account: state.account,
         chain,
@@ -276,7 +408,7 @@ async function postMemo() {
       });
       const raw = outputs?.[0]?.signature;
       if (!raw) throw new Error('钱包未返回签名');
-      signature = bs58.encode(raw);
+      signature = typeof raw === 'string' ? raw : bs58.encode(raw);
     } else {
       const res = await state.provider.signAndSendTransaction(tx);
       signature = res?.signature || res;
@@ -294,7 +426,7 @@ async function postMemo() {
     setStatus('✅ 留言已永久写入 Cookie Chain', 'ok', EXPLORER_TX + signature);
     ui.memoInput.value = '';
     updateCharCount();
-    await Promise.all([loadMemos(), refreshBalance()]);
+    await Promise.all([loadMemos(), refreshBalance(), loadPublicFeed()]);
   } catch (err) {
     console.error('[post]', err);
     const msg = err?.message || String(err);
@@ -308,33 +440,59 @@ async function postMemo() {
   }
 }
 
-// ------------------------------------------------------------------ 读取历史留言
+// ------------------------------------------------------------------ 读取：某笔交易的 Memo（兜底路径）
+/**
+ * 仅当 getSignaturesForAddress 没带 memo 字段时才调用。
+ * 走原始 RPC —— 既避开节点未实现的 getParsedTransaction，
+ * 也避开 web3.js v1 对 jsonParsed 结构的校验异常。
+ */
+async function fetchMemoByTx(signature) {
+  let tx;
+  try {
+    tx = await rpc('getTransaction', [
+      signature,
+      { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' },
+    ]);
+  } catch {
+    return null;
+  }
+  if (!tx) return null;
+
+  // 1) 已解析指令里直接拿
+  for (const ix of tx.transaction?.message?.instructions || []) {
+    if (ix.programId === MEMO_PROGRAM_STR && typeof ix.parsed === 'string') return ix.parsed;
+  }
+  // 2) 从程序日志里抓
+  for (const line of tx.meta?.logMessages || []) {
+    const m = /Program log: Memo \(len \d+\): "(.*)"$/.exec(line);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------ 读取：我的留言
 async function loadMemos() {
   if (!state.address) return;
   ui.board.innerHTML = '<p class="empty">读取链上记录…</p>';
   try {
     const pk = new PublicKey(state.address);
-    const sigs = await connection.getSignaturesForAddress(pk, { limit: 15 }, 'confirmed');
+    const sigs = await connection.getSignaturesForAddress(pk, { limit: 20 }, 'confirmed');
+
     const rows = [];
     for (const s of sigs) {
       if (s.err) continue;
-      let parsed;
-      try {
-        parsed = await connection.getParsedTransaction(s.signature, {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        });
-      } catch {
-        continue;
+      // 路径 A：签名列表自带 memo（实测 Cookie Chain 会返回）
+      let text = stripMemoPrefix(s.memo);
+      // 路径 B：兜底
+      if (!text) {
+        try {
+          text = (await fetchMemoByTx(s.signature)) || '';
+        } catch {
+          text = '';
+        }
       }
-      const ixs = parsed?.transaction?.message?.instructions || [];
-      const memo = ixs.find((ix) => ix.program === 'spl-memo');
-      if (memo) {
-        rows.push({
-          text: typeof memo.parsed === 'string' ? memo.parsed : String(memo.parsed),
-          sig: s.signature,
-          blockTime: s.blockTime,
-        });
+      if (text) {
+        rows.push({ text, sig: s.signature, blockTime: s.blockTime });
       }
     }
 
@@ -344,32 +502,134 @@ async function loadMemos() {
     }
     ui.board.innerHTML = '';
     for (const r of rows) {
-      const item = document.createElement('div');
-      item.className = 'memo';
-      const p = document.createElement('p');
-      p.className = 'memo-text';
-      p.textContent = r.text;
-      const meta = document.createElement('div');
-      meta.className = 'memo-meta';
-      const when = r.blockTime
-        ? new Date(r.blockTime * 1000).toLocaleString('zh-CN')
-        : '未知时间';
-      meta.innerHTML = `<span>${when}</span>`;
-      const a = document.createElement('a');
-      a.href = EXPLORER_TX + r.sig;
-      a.target = '_blank';
-      a.rel = 'noreferrer';
-      a.className = 'mono';
-      a.textContent = short(r.sig, 6);
-      meta.appendChild(a);
-      item.appendChild(p);
-      item.appendChild(meta);
-      ui.board.appendChild(item);
+      ui.board.appendChild(memoItem(r, { showAuthor: false }));
     }
   } catch (err) {
     console.error('[memos]', err);
     ui.board.innerHTML = `<p class="empty">读取失败：${err?.message || err}</p>`;
   }
+}
+
+// ------------------------------------------------------------------ 读取：全链公开动态（无需钱包）
+async function loadPublicFeed() {
+  ui.feed.innerHTML = '<p class="empty">读取链上最新记录…</p>';
+  try {
+    // 直接读 Memo 程序的最近签名 —— 不需要任何钱包，也不需要 getParsedTransaction
+    const sigs = await connection.getSignaturesForAddress(
+      MEMO_PROGRAM_ID,
+      { limit: FEED_SIZE },
+      'confirmed'
+    );
+
+    const rows = [];
+    for (const s of sigs) {
+      if (s.err) continue;
+      const text = stripMemoPrefix(s.memo);
+      if (!text) continue;
+      rows.push({ text, sig: s.signature, blockTime: s.blockTime, author: authorCache.get(s.signature) });
+    }
+
+    if (!rows.length) {
+      ui.feed.innerHTML = '<p class="empty">暂时读不到链上记录。</p>';
+      return;
+    }
+
+    ui.feedCount.textContent = `最新 ${rows.length} 条`;
+    ui.feed.innerHTML = '';
+    for (const r of rows) {
+      ui.feed.appendChild(memoItem(r, { showAuthor: true, author: r.author }));
+    }
+    state.feedLoaded = true;
+
+    // 异步补齐作者地址（渐进增强，不阻塞首屏）
+    enrichAuthors(rows);
+  } catch (err) {
+    console.error('[feed]', err);
+    ui.feed.innerHTML = `<p class="empty">读取失败：${err?.message || err}</p>`;
+  }
+}
+
+/**
+ * 补齐作者地址：取交易详情里的 fee payer（= 签名者）。
+ * 用**一次批量请求**拿全部结果，而不是逐条打 RPC —— 首屏更快，也更不容易被限流。
+ */
+async function enrichAuthors(rows) {
+  const pending = rows.filter((r) => !r.author && !authorCache.has(r.sig));
+  if (!pending.length) return;
+
+  let results;
+  try {
+    results = await rpcBatch(
+      pending.map((r) => ({
+        method: 'getTransaction',
+        params: [r.sig, { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' }],
+      }))
+    );
+  } catch (err) {
+    console.warn('[feed] 作者地址解析失败（非致命）', err);
+    return;
+  }
+
+  pending.forEach((r, i) => {
+    const addr = payerOf(results[i]);
+    if (!addr) return;
+    authorCache.set(r.sig, addr);
+    const el = document.querySelector(`[data-sig="${r.sig}"] .memo-author`);
+    if (el) {
+      el.textContent = short(addr, 4);
+      el.title = addr;
+      el.href = EXPLORER_ADDR + addr;
+      el.classList.remove('hidden');
+    }
+  });
+}
+
+/** 渲染一条留言卡片 */
+function memoItem(row, { showAuthor = false, author = null } = {}) {
+  const item = document.createElement('div');
+  item.className = 'memo';
+  item.dataset.sig = row.sig;
+
+  const p = document.createElement('p');
+  p.className = 'memo-text';
+  p.textContent = row.text;
+
+  const meta = document.createElement('div');
+  meta.className = 'memo-meta';
+
+  const left = document.createElement('div');
+  left.className = 'memo-left';
+  const when = document.createElement('span');
+  when.textContent = fmtTime(row.blockTime);
+  const ago = document.createElement('span');
+  ago.className = 'memo-ago';
+  ago.textContent = agree(row.blockTime);
+  left.appendChild(when);
+  left.appendChild(ago);
+
+  if (showAuthor) {
+    const a = document.createElement('a');
+    a.className = 'memo-author mono' + (author ? '' : ' hidden');
+    a.href = author ? EXPLORER_ADDR + author : '#';
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    a.textContent = author ? short(author, 4) : '';
+    a.title = author || '';
+    left.appendChild(a);
+  }
+
+  const link = document.createElement('a');
+  link.href = EXPLORER_TX + row.sig;
+  link.target = '_blank';
+  link.rel = 'noreferrer';
+  link.className = 'mono';
+  link.textContent = short(row.sig, 6);
+
+  meta.appendChild(left);
+  meta.appendChild(link);
+  item.appendChild(p);
+  item.appendChild(meta);
+  return item;
 }
 
 // ------------------------------------------------------------------ 输入计数
@@ -386,6 +646,7 @@ ui.connectBtn.addEventListener('click', () => {
 ui.disconnectBtn.addEventListener('click', disconnect);
 ui.postBtn.addEventListener('click', postMemo);
 ui.refreshBtn.addEventListener('click', loadMemos);
+ui.feedRefreshBtn.addEventListener('click', loadPublicFeed);
 ui.memoInput.addEventListener('input', updateCharCount);
 ui.memoInput.addEventListener('keydown', (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') postMemo();
@@ -394,4 +655,8 @@ ui.memoInput.addEventListener('keydown', (e) => {
 // ------------------------------------------------------------------ 启动
 loadNetwork();
 updateCharCount();
+loadPublicFeed();                 // 无需钱包，首屏即可看到链上实况
 setInterval(loadNetwork, 30_000);
+setInterval(() => {
+  if (!document.hidden) loadPublicFeed();
+}, 60_000);

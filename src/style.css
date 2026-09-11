@@ -153,6 +153,23 @@ textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(217, 11
 .memo-text { margin: 0 0 8px; font-size: 14.5px; word-break: break-word; white-space: pre-wrap; }
 .memo-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--sub); }
 
+/* ---------------- 标签 / 区块头 ---------------- */
+.tag {
+  display: inline-block; vertical-align: middle;
+  font-size: 11px; font-weight: 600; letter-spacing: .2px;
+  color: #92600a; background: #fdf6ec; border: 1px solid #f3e0c0;
+  border-radius: 999px; padding: 2px 9px; margin-left: 8px;
+}
+.head-right { display: flex; align-items: center; gap: 10px; }
+.feed-hint { margin: -6px 0 14px; }
+
+/* ---------------- 留言条目补充 ---------------- */
+.memo-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.memo-ago { color: #a4988a; }
+.memo-author { font-size: 12px; }
+.memo-author::before { content: '· '; color: #c9bfae; }
+.memo-ago::before { content: '· '; color: #c9bfae; }
+
 /* ---------------- 页脚 ---------------- */
 .foot {
   position: relative; z-index: 1;

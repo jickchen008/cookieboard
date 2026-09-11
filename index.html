@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CookieBoard — 链上留言板 on Cookie Chain</title>
-  <meta name="description" content="CookieBoard is a cApp on Cookie Chain: connect a wallet and write messages permanently on-chain." />
+  <meta name="description" content="CookieBoard is a cApp on Cookie Chain: connect a wallet and write messages permanently on-chain. The live chain feed works without a wallet." />
   <link rel="stylesheet" href="/src/style.css" />
 </head>
 <body>
@@ -24,6 +24,8 @@
       <span class="sep">·</span>
       <span>高度 <b id="block-height">—</b></span>
       <span class="sep">·</span>
+      <span>链上交易 <b id="tx-total">—</b></span>
+      <span class="sep">·</span>
       <span class="core" id="core-ver">—</span>
     </div>
   </header>
@@ -32,7 +34,7 @@
 
     <section class="hero">
       <h1>把一句话，刻在链上。</h1>
-      <p>连接你的 SVM 钱包，写一条留言。它会作为一笔真实交易，永久记录在 Cookie Chain 上 —— 亚秒确认，手续费不到一分钱。</p>
+      <p>连接你的 SVM 钱包，写一条留言。它会作为一笔真实交易，永久记录在 Cookie Chain 上 —— 亚秒确认，手续费不到一分钱。不装钱包也能看：下方链上动态是实时读取的。</p>
     </section>
 
     <div class="grid">
@@ -77,6 +79,23 @@
       </section>
 
     </div>
+
+    <!-- 无需钱包：全链实时动态 -->
+    <section class="card board-card">
+      <div class="card-head">
+        <h2>Cookie Chain 最新链上动态 <span class="tag">无需钱包</span></h2>
+        <div class="head-right">
+          <span id="feed-count" class="hint"></span>
+          <button id="feed-refresh" class="btn btn-ghost">刷新</button>
+        </div>
+      </div>
+      <p class="hint feed-hint">
+        直接读取链上 Memo 程序的最近签名记录，实时反映这条链正在发生什么。
+      </p>
+      <div id="feed" class="board">
+        <p class="empty">读取链上最新记录…</p>
+      </div>
+    </section>
 
     <section class="card board-card">
       <div class="card-head">
